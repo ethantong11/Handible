@@ -121,6 +121,9 @@ const sceneLoader = new SceneLoadingSystem();
 const raycaster = new THREE.Raycaster();
 let grabbedObject = null;
 let sceneCache = {};
+let draggedPiece = null;
+let dragStartPosition = null;
+let validMoveHighlights = [];
 
 /**
  * Surface interaction system for handling cursor interactions with flat surfaces
@@ -174,7 +177,7 @@ class SurfaceInteractionSystem {
     let worldPos;
 
     // Check for chessboard first
-    const chessboard = surface.getObjectByProperty('isChessboard', true);
+    const chessboard = surface.getObjectByProperty('userData', {isChessboard: true});
     if (chessboard) {
       worldPos = this.handleChessboardInteraction(handIndex, cursorPoint, surface, chessboard, cone);
     } else if (config.handleCursorPosition) {
@@ -285,53 +288,49 @@ class SurfaceInteractionSystem {
 
     // Get square and its world position
     const squareIndex = clampedRow * CHESSBOARD_SIZE + clampedCol;
-    const square = chessboard.children[squareIndex];
+    const square = chessboard.children.find(child => {
+      return child.userData.isSquare && 
+             child.userData.row === clampedRow && 
+             child.userData.col === clampedCol;
+    });
     
     if (!square) return null;
 
-    // Reset previous square colors
-    chessboard.children.forEach(s => {
-      if (s !== square) {
-        // Store original color if not already stored
-        if (!s.userData.defaultColor) {
-          s.userData.defaultColor = s.material.color.clone();
+    // Don't highlight squares if we're dragging a piece
+    if (!draggedPiece) {
+      // Reset previous square colors
+      chessboard.children.forEach(s => {
+        if (s.userData.isSquare && s !== square && !s.userData.isValidMove) {
+          if (s.userData.defaultColor !== undefined) {
+            s.material.color.set(s.userData.defaultColor);
+          }
+          s.userData.isHighlighted = false;
         }
-        s.material.color.set(s.userData.defaultColor);
-        s.userData.isHighlighted = false; // Reset highlight flag
+      });
+
+      // Highlight current square only if not showing valid moves
+      if (validMoveHighlights.length === 0) {
+        if (square.userData.defaultColor === undefined) {
+          square.userData.defaultColor = square.material.color.getHex();
+        }
+        square.material.color.set(HIGHLIGHT_COLOR);
+        square.userData.isHighlighted = true;
       }
-    });
-
-    // Store original color if not already stored
-    if (!square.userData.defaultColor) {
-      square.userData.defaultColor = square.material.color.clone();
-    }
-
-    // Highlight current square
-    const currentColor = square.material.color.clone();
-    if (!square.userData.isHighlighted) {
-      square.userData.isHighlighted = true;
-      square.userData.lastColor = currentColor;
-      square.material.color.set(HIGHLIGHT_COLOR);
     }
     
     // Get world position for cursor
     const worldPos = new THREE.Vector3();
     square.getWorldPosition(worldPos);
+    worldPos.y += 0.05; // Slightly above the square
 
     // Store last snapped square
     lastSnappedSquarePerHand[handIndex] = { row: clampedRow, col: clampedCol, square };
 
-    // Update grabbable objects on the chessboard
-    const grabbableObjects = chessboard.children.filter(obj => obj.userData.isGrabbable);
-    grabbableObjects.forEach(obj => {
-      // Ensure we preserve the original color
-      if (!obj.userData.defaultColor) {
-        obj.userData.defaultColor = obj.material.color.clone();
-      }
-      if (!obj.userData.handIndex) {
-        obj.material.color.copy(obj.userData.defaultColor);
-      }
-    });
+    // Update dragged piece position if exists
+    if (draggedPiece && draggedPiece.userData.handIndex === handIndex) {
+      draggedPiece.position.copy(worldPos);
+      draggedPiece.position.y += 0.1; // Float above board
+    }
 
     return worldPos;
   }
@@ -441,7 +440,6 @@ export function onPinchStart(handIndex, handedness, isUIActive) {
   onPinchStartCallbacks.forEach(cb => cb(handIndex, handedness));
 
   console.log("pinch Start", handIndex, handedness, isUIActive);
-  // console.log(`Hand ${handIndex} pinch START, isUIActive: ${isUIActive}, handedness: ${handedness}`);
   const { scene } = getSceneObjects();
   const { smoothedLandmarksPerHand } = getHandTrackingData();
   const handLandmarks = smoothedLandmarksPerHand[handIndex];
@@ -541,10 +539,16 @@ export function onPinchStart(handIndex, handedness, isUIActive) {
 
 export function onPinchEnd(handIndex) {
   // Call user callbacks
-  onPinchEndCallbacks.forEach(cb => cb(handIndex, handedness));
+  onPinchEndCallbacks.forEach(cb => cb(handIndex));
 
   console.log(`Hand ${handIndex} pinch END`);
-  releaseObject(handIndex);
+  
+  // Handle chess piece release
+  if (draggedPiece && draggedPiece.userData.handIndex === handIndex) {
+    handleChessPieceRelease(handIndex);
+  } else {
+    releaseObject(handIndex);
+  }
 }
 
 // New: Cache function (call in initGestureControl or on scene switch)
@@ -981,6 +985,12 @@ export function grabNearestObject(handIndex, handedness, isUIActive, triggeredBu
   const conePosition = new THREE.Vector3();
   cone.getWorldPosition(conePosition); // Get cone's world position (cursor tip)
   
+  // Check for chess pieces first
+  const chessPiece = tryGrabChessPiece(handIndex, conePosition, scene);
+  if (chessPiece) {
+    return; // Chess piece handled
+  }
+  
   // Find nearest grabbable object near cone
   const grabbableObjects = [];
   scene.traverse(obj => {
@@ -1040,10 +1050,6 @@ export function grabNearestObject(handIndex, handedness, isUIActive, triggeredBu
   if (grabbedObject) {
     console.log("grabbedObject");
   }
-  // if (grabbedObject.userData.isKnob) {
-  //   grabbedObject.material.color.set(grabbedObject.userData.activeColor);
-  // }
-  // console.log(`Hand ${handIndex} grabbed: ${grabbedObject.name || grabbedObject.id}`);
 }
 
 function releaseObject(handIndex) {
@@ -1080,6 +1086,261 @@ function releaseObject(handIndex) {
     // Clean up hand association
     delete grabbedObject.userData.handIndex;
     grabbedObject = null;
+  }
+}
+
+// Chess-specific functions
+function tryGrabChessPiece(handIndex, conePosition, scene) {
+  if (!window.chessGame || !window.piecesGroup) return null;
+  
+  const lastSquare = lastSnappedSquarePerHand[handIndex];
+  if (!lastSquare) return null;
+  
+  // Check if it's the current player's turn
+  const isWhiteTurn = window.chessGame.currentTurn === 'white';
+  
+  // Find piece at current square
+  let targetPiece = null;
+  let minDistance = Infinity;
+  
+  window.piecesGroup.children.forEach(piece => {
+    if (piece.userData.isPiece && 
+        piece.userData.row === lastSquare.row && 
+        piece.userData.col === lastSquare.col &&
+        piece.userData.isWhite === isWhiteTurn) {
+      const piecePos = new THREE.Vector3();
+      piece.getWorldPosition(piecePos);
+      const distance = conePosition.distanceTo(piecePos);
+      if (distance < minDistance && distance < 0.3) {
+        minDistance = distance;
+        targetPiece = piece;
+      }
+    }
+  });
+  
+  if (!targetPiece) return null;
+  
+  // Start dragging the piece
+  draggedPiece = targetPiece;
+  dragStartPosition = { row: targetPiece.userData.row, col: targetPiece.userData.col };
+  
+  // Visual feedback
+  targetPiece.traverse(child => {
+    if (child.isMesh && child.material) {
+      child.material.color.set(0xffd700); // Gold color when grabbed
+      child.material.emissive = new THREE.Color(0xffd700);
+      child.material.emissiveIntensity = 0.3;
+    }
+  });
+  
+  // Scale up slightly
+  targetPiece.scale.multiplyScalar(1.2);
+  targetPiece.userData.handIndex = handIndex;
+  
+  // Show valid moves
+  showValidMovesForPiece(targetPiece);
+  
+  // Play grab sound
+  audioSystem.createClickSound();
+  
+  console.log('Grabbed chess piece:', targetPiece.userData.type, 'at', dragStartPosition);
+  return targetPiece;
+}
+
+function showValidMovesForPiece(piece) {
+  if (!window.chessGame || !window.boardGroup) return;
+  
+  clearValidMoveHighlights();
+  
+  const validMoves = window.chessGame.getValidMoves(piece.userData.row, piece.userData.col);
+  
+  validMoves.forEach(move => {
+    const square = window.boardGroup.children.find(child => 
+      child.userData.isSquare && 
+      child.userData.row === move.row && 
+      child.userData.col === move.col
+    );
+    
+    if (square) {
+      square.userData.isValidMove = true;
+      validMoveHighlights.push(square);
+      
+      // Highlight valid move squares
+      square.material.color.set(0x90EE90); // Light green for valid moves
+      
+      // Add glow effect for captures
+      const targetPiece = window.piecesGroup.children.find(p => 
+        p.userData.isPiece && 
+        p.userData.row === move.row && 
+        p.userData.col === move.col
+      );
+      
+      if (targetPiece && targetPiece.userData.isWhite !== piece.userData.isWhite) {
+        square.material.color.set(0xFF6B6B); // Red tint for capture moves
+      }
+    }
+  });
+}
+
+function clearValidMoveHighlights() {
+  validMoveHighlights.forEach(square => {
+    if (square.userData.defaultColor !== undefined) {
+      square.material.color.set(square.userData.defaultColor);
+    }
+    square.userData.isValidMove = false;
+  });
+  validMoveHighlights = [];
+}
+
+function handleChessPieceRelease(handIndex) {
+  if (!draggedPiece || draggedPiece.userData.handIndex !== handIndex) return;
+  
+  const targetSquare = lastSnappedSquarePerHand[handIndex];
+  
+  if (targetSquare && window.chessGame) {
+    // Try to make the move
+    const moveSuccessful = window.chessGame.makeMove(
+      dragStartPosition.row,
+      dragStartPosition.col,
+      targetSquare.row,
+      targetSquare.col
+    );
+    
+    if (moveSuccessful) {
+      // Update piece position
+      draggedPiece.userData.row = targetSquare.row;
+      draggedPiece.userData.col = targetSquare.col;
+      
+      // Snap to exact position
+      const squareSize = 0.25;
+      const halfSize = 1; // (8 * 0.25) / 2
+      draggedPiece.position.x = (targetSquare.col * squareSize) - halfSize + squareSize / 2;
+      draggedPiece.position.z = (targetSquare.row * squareSize) - halfSize + squareSize / 2;
+      draggedPiece.position.y = 0.1;
+      
+      // Remove captured piece if any
+      const capturedPiece = window.piecesGroup.children.find(p => 
+        p !== draggedPiece &&
+        p.userData.isPiece && 
+        p.userData.row === targetSquare.row && 
+        p.userData.col === targetSquare.col
+      );
+      
+      if (capturedPiece) {
+        window.piecesGroup.remove(capturedPiece);
+        audioSystem.createErrorSound(); // Capture sound
+      } else {
+        audioSystem.createSuccessSound(); // Move sound
+      }
+      
+      // Check for game end conditions
+      if (window.chessGame.isCheckmate()) {
+        console.log('Checkmate! Game Over');
+        audioSystem.createSuccessSound();
+      } else if (window.chessGame.isStalemate()) {
+        console.log('Stalemate! Game is a draw');
+      }
+      
+      // AI move (if playing against bot)
+      if (window.chessGame.currentTurn === 'black') {
+        setTimeout(() => makeAIMove(), 1000);
+      }
+    } else {
+      // Invalid move - return piece to original position
+      const squareSize = 0.25;
+      const halfSize = 1;
+      draggedPiece.position.x = (dragStartPosition.col * squareSize) - halfSize + squareSize / 2;
+      draggedPiece.position.z = (dragStartPosition.row * squareSize) - halfSize + squareSize / 2;
+      draggedPiece.position.y = 0.1;
+      
+      audioSystem.createErrorSound();
+    }
+  } else {
+    // No target square - return to original position
+    const squareSize = 0.25;
+    const halfSize = 1;
+    draggedPiece.position.x = (dragStartPosition.col * squareSize) - halfSize + squareSize / 2;
+    draggedPiece.position.z = (dragStartPosition.row * squareSize) - halfSize + squareSize / 2;
+    draggedPiece.position.y = 0.1;
+  }
+  
+  // Reset visual feedback
+  draggedPiece.traverse(child => {
+    if (child.isMesh && child.material) {
+      const isWhite = draggedPiece.userData.isWhite;
+      child.material.color.set(isWhite ? 0xffffff : 0x333333);
+      if (child.material.emissive) {
+        child.material.emissive = new THREE.Color(0x000000);
+        child.material.emissiveIntensity = 0;
+      }
+    }
+  });
+  
+  // Reset scale
+  draggedPiece.scale.set(1, 1, 1);
+  
+  // Clear highlights
+  clearValidMoveHighlights();
+  
+  // Clean up
+  delete draggedPiece.userData.handIndex;
+  draggedPiece = null;
+  dragStartPosition = null;
+}
+
+function makeAIMove() {
+  if (!window.chessGame || window.chessGame.currentTurn !== 'black') return;
+  
+  const bestMove = window.chessGame.getBestMove(false, 2); // Depth 2 for reasonable speed
+  
+  if (bestMove) {
+    // Find the piece to move
+    const piece = window.piecesGroup.children.find(p => 
+      p.userData.isPiece && 
+      p.userData.row === bestMove.from.row && 
+      p.userData.col === bestMove.from.col
+    );
+    
+    if (piece) {
+      // Animate the move
+      const squareSize = 0.25;
+      const halfSize = 1;
+      const targetX = (bestMove.to.col * squareSize) - halfSize + squareSize / 2;
+      const targetZ = (bestMove.to.row * squareSize) - halfSize + squareSize / 2;
+      
+      // Make the move in game logic
+      window.chessGame.makeMove(
+        bestMove.from.row,
+        bestMove.from.col,
+        bestMove.to.row,
+        bestMove.to.col
+      );
+      
+      // Remove captured piece if any
+      const capturedPiece = window.piecesGroup.children.find(p => 
+        p !== piece &&
+        p.userData.isPiece && 
+        p.userData.row === bestMove.to.row && 
+        p.userData.col === bestMove.to.col
+      );
+      
+      if (capturedPiece) {
+        window.piecesGroup.remove(capturedPiece);
+      }
+      
+      // Update piece data and position
+      piece.userData.row = bestMove.to.row;
+      piece.userData.col = bestMove.to.col;
+      piece.position.x = targetX;
+      piece.position.z = targetZ;
+      
+      audioSystem.createSuccessSound();
+      
+      // Check for game end
+      if (window.chessGame.isCheckmate()) {
+        console.log('AI wins! Checkmate!');
+      }
+    }
   }
 }
 
@@ -1136,6 +1397,10 @@ async function switchToScene(sceneName) {
     case 'simple':
       const { setupSimpleScene } = await import('./simpleScene.js');
       setupFunction = setupSimpleScene;
+      break;
+    case 'chess':
+      const { setupChessScene } = await import('./chessScene.js');
+      setupFunction = setupChessScene;
       break;
     default:
       console.error(`Unknown scene: ${sceneName}`);
